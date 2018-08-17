@@ -34,6 +34,7 @@ const (
 var (
 	masterURL  string
 	kubeconfig string
+	messages   = make(chan DispatchMessage)
 )
 
 // StubBus is able to broadcast messages to multiple subscribers, but does not
@@ -46,6 +47,11 @@ type StubBus struct {
 	monitor    *buses.Monitor
 	receiver   *buses.MessageReceiver
 	dispatcher *buses.MessageDispatcher
+}
+
+type DispatchMessage struct {
+	channel *buses.ChannelReference
+	message *buses.Message
 }
 
 // NewStubBus creates a stub bus.
@@ -68,21 +74,37 @@ func (b *StubBus) Run(stopCh <-chan struct{}) {
 		}
 	}()
 	b.monitor.WaitForCacheSync(stopCh)
+	go b.runDispatchLoop(stopCh)
 	b.receiver.Run(stopCh)
 }
 
-// receiveMessage receives new messages for the bus from the message receiver,
-// looks up active subscriptions for the channel and dispatches the message to
-// each subscriber.
+// receiveMessage receives new messages for the bus from the message receiver
+// and publishes the message and its knative channel reference to a go channel
+// from which the dispatch loop is receiving.
 func (b *StubBus) receiveMessage(channel *buses.ChannelReference, message *buses.Message) error {
-	subscriptions := b.monitor.Subscriptions(channel.Name, channel.Namespace)
-	if subscriptions == nil {
-		return buses.ErrUnknownChannel
-	}
-	for _, subscription := range *subscriptions {
-		go b.dispatchMessage(subscription, channel, message)
+	messages <- DispatchMessage{
+		channel: channel,
+		message: message,
 	}
 	return nil
+}
+
+// the dispatch loop receives messages along with their knative channel references
+// from the message receiver via a go channel, then looks up active subscriptions
+// for the knative channel and dispatches the message to each subscriber.
+func (b *StubBus) runDispatchLoop(stopCh <-chan struct{}) {
+	for {
+		select {
+		case m := <-messages:
+			channel := m.channel
+			subscriptions := b.monitor.Subscriptions(channel.Name, channel.Namespace)
+			for _, subscription := range *subscriptions {
+				go b.dispatchMessage(subscription, channel, m.message)
+			}
+		case <-stopCh:
+			return
+		}
+	}
 }
 
 // dispatchMessage dispatches messages for the bus to a channel's subscriber.
